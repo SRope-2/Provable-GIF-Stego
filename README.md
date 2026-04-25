@@ -61,7 +61,7 @@ Provable-GIF-Stego/
 ### 1. Clone this repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/Provable-GIF-Stego.git
+git clone https://github.com/SRope-2/Provable-GIF-Stego.git
 cd Provable-GIF-Stego
 ```
 
