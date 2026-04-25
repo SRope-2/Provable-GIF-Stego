@@ -165,20 +165,6 @@ python scripts/run_stego.py \
 
 ---
 
-## Dependencies
-
-| Package | Purpose |
-|:--------|:--------|
-| `diffusers >= 0.25` | Stable Diffusion pipeline, schedulers |
-| `transformers` | CLIP text encoder / tokenizer |
-| `torch >= 2.0` | Core deep learning framework |
-| `einops` | Tensor rearrangement in `pipeline_stego.py` |
-| `pycryptodome` | ChaCha20 stream cipher |
-| `reedsolo` | Reed-Solomon codec (reserved for future error-correction extension) |
-| `scipy` | Truncated-normal sampling, beta incomplete function |
-| AnimateDiff | Video UNet (`UNet3DConditionModel`), motion module — **clone separately** |
-
----
 ## Acknowledgement
 
 This code is built upon the following repositories:
