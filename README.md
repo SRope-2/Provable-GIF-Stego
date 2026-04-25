@@ -2,7 +2,7 @@
 
 > **Provably Secure and Robust Training-Free GIF Steganography via Diffusion Models**
 >
-> *IEEE Transactions on Multimedia (TMM) — Under Review*
+> *IEEE Transactions on Multimedia (TMM) 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
