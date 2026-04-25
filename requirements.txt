@@ -1,0 +1,51 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Diffusion model framework
+diffusers>=0.25.0
+transformers>=4.36.0
+accelerate>=0.25.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Image processing
+Pillow>=9.5.0
+einops>=0.7.0
+
+# Cryptography (for ChaCha20 mode)
+pycryptodome>=3.18.0
+
+# Reed-Solomon error correction
+reedsolo>=1.7.0
+
+# Packaging utilities
+packaging>=23.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Visualization (used in inverse_stable_diffusion.py)
+matplotlib>=3.7.0
+
+# Dataset loading (used in optim_utils.py / io_utils.py)
+datasets>=2.14.0
+
+# CLIP score evaluation (optional, for evaluation scripts)
+open-clip-torch>=2.20.0
+
+# --------------------------------------------------------------------------
+# AnimateDiff (NOT on PyPI — clone separately)
+# --------------------------------------------------------------------------
+# git clone https://github.com/guoyww/AnimateDiff.git
+# cd AnimateDiff && pip install -r requirements.txt
+# Then either:
+#   a) add AnimateDiff repo root to PYTHONPATH, or
+#   b) pass --animatediff_path /path/to/AnimateDiff to run_stego.py
+#
+# AnimateDiff internally requires:
+#   omegaconf>=2.3.0
+#   xformers>=0.0.20   (optional but recommended for memory efficiency)
+#   safetensors>=0.3.1
