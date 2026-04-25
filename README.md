@@ -135,32 +135,6 @@ python scripts/run_stego.py \
     --chacha
 ```
 
-Upon completion, the script prints a summary report showing the extraction time, number of frames processed, and bit accuracy against the stored ground-truth watermark.
-
-### Dry Run (no model weights needed)
-
-To verify that the codebase imports and the watermark generation logic works without downloading any model:
-
-```bash
-python - <<'EOF'
-import sys, os
-sys.path.insert(0, '.')
-from core.watermark_core import Gaussian_Shading_chacha, Gaussian_Shading
-
-# --- ChaCha20 mode ---
-wm_chacha = Gaussian_Shading_chacha(ch_factor=1, hw_factor=2, fpr=1e-6, user_number=1_000_000)
-latent = wm_chacha.create_watermark_and_return_w()
-print(f"[chacha] latent shape: {latent.shape}")   # -> torch.Size([1, 4, 64, 64])
-
-# --- Standard OTP mode ---
-wm_std = Gaussian_Shading(ch_factor=1, hw_factor=2, fpr=1e-6, user_number=1_000_000,
-                           output_dir='./output_test')
-latents_tuple = wm_std.create_watermark_and_return_w(group_id=0, save=True)
-print(f"[standard] #latents: {len(latents_tuple)}, each: {latents_tuple[0].shape}")
-print("All imports OK.")
-EOF
-```
-
 ---
 
 ## Parameters
@@ -205,7 +179,12 @@ EOF
 | AnimateDiff | Video UNet (`UNet3DConditionModel`), motion module — **clone separately** |
 
 ---
+## Acknowledgement
 
+This code is built upon the following repositories:
+
+* [AnimateDiff](https://github.com/guoyww/AnimateDiff.git)
+* [Gaussian-Shading](https://github.com/bsmhmmlf/Gaussian-Shading.git)
 ## License
 
 This project is released under the [MIT License](LICENSE).
