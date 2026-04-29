@@ -1,12 +1,5 @@
 """
 watermark_core.py 
-
-论文流程:
-  Embedding:
-    S -> 重复d次 -> 每帧独立key加密(ChaCha20) -> sign-aware mapping -> latent Z'_T
-  Extraction:
-    Z'_T -> 取符号 -> 解密 -> 帧内d次重复majority vote -> 帧间majority vote -> S'
-
 """
 
 import os
