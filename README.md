@@ -39,8 +39,8 @@ The core challenge of this work: extending single-image watermarking to multi-fr
 Provable-GIF-Stego/
 ├── core/
 │   ├── __init__.py
-│   ├── watermark_core.py          # Watermark generation (OTP & ChaCha20) + extraction (diffusion_inverse)
-│   ├── pipeline_stego.py          # Sender pipeline: AnimateDiff integration + watermark injection
+│   ├── method_core.py          # Method generation (OTP & ChaCha20) + extraction (diffusion_inverse)
+│   ├── pipeline_stego.py          # Sender pipeline: AnimateDiff integration 
 │   ├── inverse_stable_diffusion.py # Receiver DDIM inversion pipeline
 │   ├── modified_stable_diffusion.py# SD pipeline base class (adapted from Gaussian Shading)
 │   ├── image_utils.py             # Image pre/post-processing and distortion simulation
