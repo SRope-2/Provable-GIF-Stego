@@ -91,8 +91,6 @@ AnimateDiff motion module weights can be downloaded from their [official release
 huggingface-cli download runwayml/stable-diffusion-v1-5 --local-dir ./models/stable-diffusion-v1-5
 ```
 
-Or download manually from [Hugging Face](https://huggingface.co/runwayml/stable-diffusion-v1-5).
-
 ---
 
 ## Quick Start
