@@ -180,5 +180,17 @@ This code is built upon the following repositories:
 * [AnimateDiff](https://github.com/guoyww/AnimateDiff.git)
 * [Gaussian-Shading](https://github.com/bsmhmmlf/Gaussian-Shading.git)
 ## License
-
 This project is released under the [MIT License](LICENSE).
+
+### Citation
+
+If you find this code or our work useful for your research, please consider citing:
+
+```bibtex
+@article{wang2026provably,
+  title={Provably Secure and Robust Training-Free GIF Steganography},
+  author={Wang, Huazhong and Sun, Linhao and Zhu, Zhiying and Jiang, Qingchao and Zhang, Xinpeng and Qian, Zhenxing},
+  journal={IEEE Transactions on Multimedia},
+  year={2026},
+  note={Accepted for publication}
+}
