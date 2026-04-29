@@ -1,25 +1,5 @@
 """
 run_stego.py — Entry point for Provable GIF Steganography.
-
-Usage examples
---------------
-# Sender (hide watermark, requires AnimateDiff + SD weights):
-python scripts/run_stego.py --mode hide \\
-    --model_path /path/to/stable-diffusion-v1-5 \\
-    --animatediff_path /path/to/animatediff \\
-    --output_path ./output/ \\
-    --prompt "A highly detailed cinematic animation" \\
-    --gen_seed 42 \\
-    --chacha
-
-# Receiver (extract & verify, requires SD v1-5 only):
-python scripts/run_stego.py --mode extract \\
-    --model_path /path/to/stable-diffusion-v1-5 \\
-    --input_gif_dir ./output/frames/ \\
-    --key_dir ./output/keys/ \\
-    --watermark_dir ./output/watermarks/ \\
-    --group_id 0 \\
-    --chacha
 """
 
 import argparse
@@ -34,7 +14,7 @@ import sys
 # Ensure project root is on sys.path regardless of working directory
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from core.watermark_core import Gaussian_Shading, Gaussian_Shading_chacha
+from core.watermark_core import Gaussian_Shading, StreamCipher
 from core.inverse_stable_diffusion import InversableStableDiffusionPipeline
 from diffusers import DDIMScheduler
 
@@ -43,19 +23,10 @@ from core.image_utils import transform_img
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-
 # ---------------------------------------------------------------------------
 # Helper: build AnimateDiff pipeline (optional, only needed for hide mode)
 # ---------------------------------------------------------------------------
 def _load_animation_pipeline(args):
-    """
-    Load the AnimateDiff AnimationPipeline.
-
-    Requires:
-      - AnimateDiff repository on sys.path (args.animatediff_path)
-      - Stable Diffusion v1-5 weights (args.model_path)
-      - AnimateDiff motion module checkpoint
-    """
     if args.animatediff_path:
         sys.path.insert(0, os.path.abspath(args.animatediff_path))
 
@@ -116,39 +87,26 @@ def _load_animation_pipeline(args):
 def run_hiding(args):
     print(f"\n{'='*55}")
     print(f"[*] MODE: HIDING (Sender)")
-    print(f"[*] ENCRYPTION: {'ChaCha20' if args.chacha else 'Standard OTP'}")
     print(f"[*] Group ID   : {args.gen_seed}")
     print(f"{'='*55}\n")
 
-    # 1. Initialise watermark module
-    if args.chacha:
-        watermark = Gaussian_Shading_chacha(
-            args.channel_copy, args.hw_copy, args.fpr, args.user_number
-        )
-    else:
-        watermark = Gaussian_Shading(
-            args.channel_copy, args.hw_copy, args.fpr, args.user_number,
-            output_dir=args.output_path,   # <-- pass configurable output dir
-        )
+    # 1. 统一初始化 watermark module
+    watermark = Gaussian_Shading(
+        args.channel_copy, args.hw_copy, args.fpr, args.user_number,
+        output_dir=args.output_path, 
+    )
 
-    # 2. Generate watermark latents
+    # 2. 生成每帧独立的加密隐变量
     print("[*] Generating encrypted watermark latents...")
-    if args.chacha:
-        # Gaussian_Shading_chacha.create_watermark_and_return_w() takes no arguments
-        init_latents_w = watermark.create_watermark_and_return_w()
-        # chacha variant returns a single tensor; wrap it for uniform handling
-        init_latents_list = [init_latents_w] * 16
-    else:
-        # Gaussian_Shading.create_watermark_and_return_w(group_id, save)
-        init_latents_tuple = watermark.create_watermark_and_return_w(
-            group_id=args.gen_seed, save=True
-        )
-        init_latents_list = list(init_latents_tuple)
+    init_latents_tuple = watermark.create_watermark_and_return_w(
+        group_id=args.gen_seed, save=True
+    )
+    init_latents_list = list(init_latents_tuple)
 
     print(f"[+] Generated {len(init_latents_list)} per-frame latents.")
     print(f"    Latent shape: {init_latents_list[0].shape}")
 
-    # 3. (Optional) Run AnimateDiff pipeline if weights are available
+    # 3. 运行 AnimateDiff
     if args.model_path and os.path.isdir(args.model_path):
         try:
             print("\n[*] Loading AnimateDiff pipeline...")
@@ -174,22 +132,19 @@ def run_hiding(args):
             )
             frames_dir = os.path.join(args.output_path, f'frames_group{args.gen_seed}')
             os.makedirs(frames_dir, exist_ok=True)
-            video = output.videos[0]  # (C, T, H, W) in [0,1]
+            video = output.videos[0]  
             from torchvision.utils import save_image
             for t in range(video.shape[1]):
                 save_image(video[:, t], os.path.join(frames_dir, f'frame_{t+1:03d}.png'))
             print(f"\n[+] SUCCESS! Frames saved to: {frames_dir}")
         except Exception as e:
-            print(f"\n[!] AnimateDiff pipeline not available: {e}")
+            print(f"\n[!] AnimateDiff pipeline error: {e}")
             print("[!] Watermark latents have been generated and saved.")
-            print(f"[+] Keys saved to : {watermark.key_dir}")
-            print(f"[+] Watermarks to : {watermark.watermark_dir}")
     else:
         print("\n[!] --model_path not provided or not found; skipping GIF generation.")
-        if not args.chacha:
-            print(f"[+] Keys saved to      : {os.path.join(args.output_path, 'keys')}")
-            print(f"[+] Watermarks saved to: {os.path.join(args.output_path, 'watermarks')}")
 
+    print(f"[+] Keys saved to      : {watermark.key_dir}")
+    print(f"[+] Watermarks saved to: {watermark.watermark_dir}")
     print(f"\n[+] Output directory: {args.output_path}")
 
 
@@ -199,11 +154,10 @@ def run_hiding(args):
 def run_extraction(args):
     print(f"\n{'='*55}")
     print(f"[*] MODE: EXTRACTION & VERIFICATION (Receiver)")
-    print(f"[*] ENCRYPTION: {'ChaCha20' if args.chacha else 'Standard OTP'}")
     print(f"[*] INPUT DIR  : {args.input_gif_dir}")
     print(f"{'='*55}\n")
 
-    # 1. Load Stable Diffusion inversion pipeline
+    # 1. 载入反演模型
     print("[*] Loading Inversable Stable Diffusion Pipeline...")
     scheduler = DDIMScheduler(
         beta_start=0.00085,
@@ -220,23 +174,19 @@ def run_extraction(args):
     pipe.safety_checker = None
     pipe = pipe.to(device)
 
-    # 2. Initialise watermark decoder
-    if args.chacha:
-        watermark = Gaussian_Shading_chacha(
-            args.channel_copy, args.hw_copy, args.fpr, args.user_number
-        )
-    else:
-        watermark = Gaussian_Shading(
-            args.channel_copy, args.hw_copy, args.fpr, args.user_number,
-            output_dir=args.output_path,
-        )
+    # 2. 统一初始化解码器
+    watermark = Gaussian_Shading(
+        args.channel_copy, args.hw_copy, args.fpr, args.user_number,
+        output_dir=args.output_path,
+    )
 
     tester_prompt = ''
     text_embeddings = pipe.get_text_embedding(tester_prompt)
 
-    # 3. Per-frame inversion + key XOR
+    # 3. 逐帧反演并加载对应密钥
     frames_per_group = 16
     extracted_latents = []
+    loaded_ciphers = []
 
     print("[*] Inverting frames back to latent space...")
     start_time = time.time()
@@ -264,51 +214,49 @@ def run_extraction(args):
             num_inference_steps=args.num_inversion_steps,
         )
 
-        reversed_m = (reversed_latents_w > 0).int()
+        # 统一转为 numpy 数组传递给底层
+        extracted_latents.append(reversed_latents_w.cpu().numpy())
 
-        # Load per-frame key (Standard OTP mode only)
-        key_file = os.path.join(args.key_dir, f'key{args.group_id}_tensor{frame_id}.pth')
+        # 根据 Numpy 格式加载相应的密钥字典
+        key_file = os.path.join(args.key_dir, f'key_{args.group_id}_frame{frame_id}.npy')
         if os.path.exists(key_file):
-            key = torch.load(key_file, map_location=device)
-            reversed_sd = (reversed_m + key) % 2
-            reversed_watermark = watermark.diffusion_inverse(reversed_sd)
-            extracted_latents.append(reversed_watermark.cpu().numpy())
+            key_data = np.load(key_file, allow_pickle=True)
+            cipher = StreamCipher()
+            # 自动适应 ChaCha20 和 后备异或模式
+            if len(key_data) == 2:
+                cipher.load_state_dict({'key': key_data[0], 'nonce': key_data[1]})
+            else:
+                cipher.load_state_dict({'seed': key_data[0]})
+            loaded_ciphers.append(cipher)
         else:
             print(f"[!] Warning: Missing key file: {key_file}")
 
     end_time = time.time()
 
-    # 4. Cross-frame majority voting
-    if not extracted_latents:
-        print("[!] No frames were successfully processed. Aborting.")
-        return
+    # 4. 调用底层 API 完成提取和双重验证
+    if len(extracted_latents) > 0 and len(loaded_ciphers) == len(extracted_latents):
+        print("\n[*] Applying Extraction and Majority Voting...")
+        S_recovered = watermark._extractor.extract(extracted_latents, loaded_ciphers)
+        
+        # 5. 读取 Ground-Truth 并验证准确率
+        wm_file = os.path.join(args.watermark_dir, f'watermark_{args.group_id}.npy')
+        if os.path.exists(wm_file):
+            original_watermark = np.load(wm_file)
+            correct_bits = (S_recovered == original_watermark).sum()
+            total_bits = original_watermark.size
+            accuracy = correct_bits / total_bits
 
-    print("\n[*] Applying Cross-Frame Majority Voting...")
-    stacked_watermarks = np.stack(extracted_latents, axis=0)
-    threshold = len(extracted_latents) / 2.0
-    final_watermark_np = (np.sum(stacked_watermarks, axis=0) > threshold).astype(int)
-    final_watermark = torch.from_numpy(final_watermark_np).to(device)
-
-    # 5. Accuracy verification
-    wm_file = os.path.join(
-        args.watermark_dir, f'watermark_tensor{args.group_id}.pth'
-    )
-    if os.path.exists(wm_file):
-        original_watermark = torch.load(wm_file, map_location=device)
-        correct_bits = (final_watermark == original_watermark).sum().item()
-        total_bits = original_watermark.numel()
-        accuracy = correct_bits / total_bits
-
-        print("\n" + "="*55)
-        print(f" ACCURACY REPORT — Stego-GIF (Group {args.group_id})")
-        print(f" Extraction Time  : {end_time - start_time:.2f} s")
-        print(f" Frames processed : {len(extracted_latents)} / {frames_per_group}")
-        print(f" Bit Accuracy     : {accuracy * 100:.4f}%")
-        print("="*55 + "\n")
+            print("\n" + "="*55)
+            print(f" ACCURACY REPORT — Stego-GIF (Group {args.group_id})")
+            print(f" Extraction Time  : {end_time - start_time:.2f} s")
+            print(f" Frames processed : {len(extracted_latents)} / {frames_per_group}")
+            print(f" Bit Accuracy     : {accuracy * 100:.4f}%")
+            print("="*55 + "\n")
+        else:
+            print(f"[!] Ground-truth watermark not found at: {wm_file}")
+            print(f"    Pass --watermark_dir pointing to the saved watermarks directory.")
     else:
-        print(f"[!] Ground-truth watermark not found at: {wm_file}")
-        print(f"    Pass --watermark_dir pointing to the saved watermarks directory.")
-
+        print("[!] Key extraction failed or missing frames. Cannot verify.")
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -319,55 +267,31 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Mode
-    parser.add_argument('--mode', type=str, required=True, choices=['hide', 'extract'],
-                        help='Sender (hide) or Receiver (extract) mode.')
-
-    # Model paths
-    parser.add_argument('--model_path', type=str, default='',
-                        help='Path to Stable Diffusion v1-5 model directory.')
-    parser.add_argument('--animatediff_path', type=str, default='',
-                        help='Path to AnimateDiff repository root (added to sys.path).')
-    parser.add_argument('--motion_module_path', type=str, default='',
-                        help='Path to AnimateDiff motion module .ckpt file.')
-
-    # I/O
-    parser.add_argument('--output_path', type=str, default='./output/',
-                        help='Root output directory for frames, keys, and watermarks.')
-    parser.add_argument('--input_gif_dir', type=str, default='',
-                        help='[extract] Directory containing frame_001.png … frame_016.png.')
-    parser.add_argument('--key_dir', type=str, default='',
-                        help='[extract] Directory containing per-frame key tensors.')
-    parser.add_argument('--watermark_dir', type=str, default='',
-                        help='[extract] Directory containing ground-truth watermark tensors.')
-    parser.add_argument('--group_id', type=int, default=0,
-                        help='[extract] Group ID matching the key/watermark file names.')
-
-    # Generation
-    parser.add_argument('--prompt', type=str,
-                        default='A highly detailed cinematic animation')
-    parser.add_argument('--gen_seed', type=int, default=0,
-                        help='[hide] Random seed for generation AND group_id for saved files.')
+    parser.add_argument('--mode', type=str, required=True, choices=['hide', 'extract'], help='Sender (hide) or Receiver (extract) mode.')
+    parser.add_argument('--model_path', type=str, default='', help='Path to Stable Diffusion v1-5 model directory.')
+    parser.add_argument('--animatediff_path', type=str, default='', help='Path to AnimateDiff repository root (added to sys.path).')
+    parser.add_argument('--motion_module_path', type=str, default='', help='Path to AnimateDiff motion module .ckpt file.')
+    parser.add_argument('--output_path', type=str, default='./output/', help='Root output directory for frames, keys, and watermarks.')
+    parser.add_argument('--input_gif_dir', type=str, default='', help='[extract] Directory containing frame_001.png … frame_016.png.')
+    parser.add_argument('--key_dir', type=str, default='', help='[extract] Directory containing per-frame key tensors.')
+    parser.add_argument('--watermark_dir', type=str, default='', help='[extract] Directory containing ground-truth watermark tensors.')
+    parser.add_argument('--group_id', type=int, default=0, help='[extract] Group ID matching the key/watermark file names.')
+    parser.add_argument('--prompt', type=str, default='A highly detailed cinematic animation')
+    parser.add_argument('--gen_seed', type=int, default=0, help='[hide] Random seed for generation AND group_id for saved files.')
     parser.add_argument('--height', type=int, default=512)
     parser.add_argument('--width', type=int, default=512)
     parser.add_argument('--num_inference_steps', type=int, default=25)
     parser.add_argument('--guidance_scale', type=float, default=7.5)
     parser.add_argument('--num_inversion_steps', type=int, default=25)
-
-    # Watermark cryptographic parameters
-    parser.add_argument('--channel_copy', type=int, default=1,
-                        help='Channel repetition factor (ch). Watermark ch-dim = 4//ch.')
-    parser.add_argument('--hw_copy', type=int, default=2,
-                        help='Spatial repetition factor (hw). Watermark spatial = 64//hw.')
+    parser.add_argument('--channel_copy', type=int, default=1, help='Channel repetition factor (ch). Watermark ch-dim = 4//ch.')
+    parser.add_argument('--hw_copy', type=int, default=2, help='Spatial repetition factor (hw). Watermark spatial = 64//hw.')
     parser.add_argument('--user_number', type=int, default=1_000_000)
-    parser.add_argument('--fpr', type=float, default=1e-6,
-                        help='Target false positive rate for threshold calibration.')
-    parser.add_argument('--chacha', action='store_true',
-                        help='Use ChaCha20 stream cipher (Gaussian_Shading_chacha).')
+    parser.add_argument('--fpr', type=float, default=1e-6, help='Target false positive rate for threshold calibration.')
+    # 保持参数兼容性，底层代码已自动接管加密推断逻辑
+    parser.add_argument('--chacha', action='store_true', help='Use ChaCha20 stream cipher (auto-detected by StreamCipher).')
 
     args = parser.parse_args()
 
-    # Set default key/watermark dirs from output_path when not explicitly given
     if not args.key_dir:
         args.key_dir = os.path.join(args.output_path, 'keys')
     if not args.watermark_dir:
@@ -379,7 +303,6 @@ def main():
         run_hiding(args)
     elif args.mode == 'extract':
         run_extraction(args)
-
 
 if __name__ == '__main__':
     main()
