@@ -1,5 +1,5 @@
 """
-watermark_core.py 
+method_core.py 
 """
 
 import os
