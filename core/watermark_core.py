@@ -1,315 +1,369 @@
+"""
+watermark_core.py 
+
+论文流程:
+  Embedding:
+    S -> 重复d次 -> 每帧独立key加密(ChaCha20) -> sign-aware mapping -> latent Z'_T
+  Extraction:
+    Z'_T -> 取符号 -> 解密 -> 帧内d次重复majority vote -> 帧间majority vote -> S'
+
+"""
+
 import os
-import torch
-from scipy.stats import norm, truncnorm
-from functools import reduce
-from scipy.special import betainc
 import numpy as np
-from Crypto.Cipher import ChaCha20
-from Crypto.Random import get_random_bytes
-from reedsolo import RSCodec
-import torch.nn as nn
+from scipy.stats import norm
 
-class Gaussian_Shading_chacha:
+# ── ChaCha20 / fallback ────────────────────────────────────────────────────
+try:
+    from Crypto.Cipher import ChaCha20
+    from Crypto.Random import get_random_bytes
+    _HAS_CHACHA = True
+except ImportError:
+    _HAS_CHACHA = False
+    import warnings
+    warnings.warn(
+        "[watermark_core] pycryptodome not found, using numpy PRNG as cipher (TEST ONLY).",
+        RuntimeWarning, stacklevel=2
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  工具函数
+# ══════════════════════════════════════════════════════════════════════════
+
+def sign_aware_mapping(bits: np.ndarray) -> np.ndarray:
     """
-    Single-frame Gaussian Shading watermark with ChaCha20 stream cipher (Sender side).
+    保持N(0,1)分布的sign-aware latent mapping。
 
-    The watermark w is encrypted via ChaCha20 before truncated-normal sampling,
-    providing cryptographic security guarantees (IND-CPA hardness).
-    Used in ChaCha20 mode (--chacha flag).
-    """
-    def __init__(self, ch_factor, hw_factor, fpr, user_number):
-        self.ch = ch_factor
-        self.hw = hw_factor
-        self.nonce = None
-        self.key = None
-        self.watermark = None
-        self.latentlength = 4 * 64 * 64
-        self.marklength = self.latentlength // (self.ch * self.hw * self.hw)
-        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    z'_{T,j} = s_j * |l|,  l ~ N(0,1)
+    s_j = +1 if bit==1 else -1
 
-        self.threshold = 1 if self.hw == 1 and self.ch == 1 else self.ch * self.hw * self.hw // 2
-        self.tp_onebit_count = 0
-        self.tp_bits_count = 0
-        self.tau_onebit = None
-        self.tau_bits = None
-
-        for i in range(self.marklength):
-            fpr_onebit = betainc(i + 1, self.marklength - i, 0.5)
-            fpr_bits = betainc(i + 1, self.marklength - i, 0.5) * user_number
-            if fpr_onebit <= fpr and self.tau_onebit is None:
-                self.tau_onebit = i / self.marklength
-            if fpr_bits <= fpr and self.tau_bits is None:
-                self.tau_bits = i / self.marklength
-
-    def stream_key_encrypt(self, sd):
-        self.key = get_random_bytes(32)
-        self.nonce = get_random_bytes(12)
-        cipher = ChaCha20.new(key=self.key, nonce=self.nonce)
-        m_byte = cipher.encrypt(np.packbits(sd).tobytes())
-        m_bit = np.unpackbits(np.frombuffer(m_byte, dtype=np.uint8))
-        return m_bit
-
-    def truncSampling(self, message):
-        z = np.zeros(self.latentlength)
-        denominator = 2.0
-        ppf = [norm.ppf(j / denominator) for j in range(int(denominator) + 1)]
-        for i in range(self.latentlength):
-            dec_mes = reduce(lambda a, b: 2 * a + b, message[i: i + 1])
-            dec_mes = int(dec_mes)
-            z[i] = truncnorm.rvs(ppf[dec_mes], ppf[dec_mes + 1])
-        z = torch.from_numpy(z).reshape(1, 4, 64, 64).float()
-        return z.to(self._device)
-
-    def create_watermark_and_return_w(self):
-        """Generate watermark and return a single encrypted initial latent."""
-        self.watermark = torch.randint(
-            0, 2, [1, 4 // self.ch, 64 // self.hw, 64 // self.hw]
-        ).to(self._device)
-        sd = self.watermark.repeat(1, self.ch, self.hw, self.hw)
-        m = self.stream_key_encrypt(sd.flatten().cpu().numpy())
-        w = self.truncSampling(m)
-        return w
-
-    def stream_key_decrypt(self, reversed_m):
-        cipher = ChaCha20.new(key=self.key, nonce=self.nonce)
-        sd_byte = cipher.decrypt(np.packbits(reversed_m).tobytes())
-        sd_bit = np.unpackbits(np.frombuffer(sd_byte, dtype=np.uint8))
-        sd_tensor = torch.from_numpy(sd_bit).reshape(1, 4, 64, 64).to(torch.uint8)
-        return sd_tensor.to(self._device)
-
-    def diffusion_inverse(self,watermark_r):
-        ch_stride = 4 // self.ch
-        hw_stride = 64 // self.hw
-        ch_list = [ch_stride] * self.ch
-        hw_list = [hw_stride] * self.hw
-        split_dim1 = torch.cat(torch.split(watermark_r, tuple(ch_list), dim=1), dim=0)
-        split_dim2 = torch.cat(torch.split(split_dim1, tuple(hw_list), dim=2), dim=0)
-        split_dim3 = torch.cat(torch.split(split_dim2, tuple(hw_list), dim=3), dim=0)
-        vote = torch.sum(split_dim3, dim=0).clone()
-        vote[vote <= self.threshold] = 0
-        vote[vote > self.threshold] = 1
-        return vote
-
-    def eval_watermark(self, reversed_w):
-        reversed_m = (reversed_w > 0).int()
-        reversed_sd = self.stream_key_decrypt(reversed_m.flatten().cpu().numpy())
-        reversed_watermark = self.diffusion_inverse(reversed_sd)
-        correct = (reversed_watermark == self.watermark).float().mean().item()
-        if correct >= self.tau_onebit:
-            self.tp_onebit_count = self.tp_onebit_count+1
-        if correct >= self.tau_bits:
-            self.tp_bits_count = self.tp_bits_count + 1
-        return correct
-
-    def get_tpr(self):
-        return self.tp_onebit_count, self.tp_bits_count
-
-
-class Gaussian_Shading:
-    """
-    Multi-frame Gaussian Shading watermark for GIF steganography (Sender side).
-
-    This class embeds a shared watermark across all 16 frames of a GIF by:
-      1. Generating a compact binary watermark `w` (shape [1, C/ch, H/hw, W/hw]).
-      2. For each frame j (0..15), sampling an independent one-time-pad key `key_j`.
-      3. Computing per-frame message `m_j = (sd XOR key_j)` and converting it via
-         truncated-normal sampling into an initial latent `z_j` injected into AnimateDiff.
-
-    At extraction, the Receiver inverts each frame to its latent, XORs with the stored
-    key, and applies majority voting across all 16 frames to recover `w`.
+    可证明 z'_{T,j} ~ N(0,1)，KL散度为0，实现理论不可检测性。
 
     Parameters
     ----------
-    ch_factor : int
-        Channel repetition factor (ch). Watermark channel dim = 4 // ch.
-    hw_factor : int
-        Spatial repetition factor (hw). Watermark spatial dim = 64 // hw.
-    fpr : float
-        Target false positive rate for threshold calibration.
-    user_number : int
-        User population size, used for traceability threshold τ_bits.
-    output_dir : str, optional
-        Root directory for saving watermarks and keys (default: './output').
+    bits : np.ndarray, shape (m,), dtype int, values in {0,1}
+
+    Returns
+    -------
+    z : np.ndarray, shape (m,), float32 — 符合N(0,1)的latent向量
     """
+    l = np.abs(np.random.randn(len(bits)).astype(np.float32))   # |l|
+    signs = np.where(bits == 1, 1.0, -1.0).astype(np.float32)  # s_j
+    return signs * l   # z'_{T,j}
+
+
+def inverse_sign_mapping(z: np.ndarray) -> np.ndarray:
+    """
+    从latent恢复bit。
+
+    b_j = 0 if sign(z_j) == -1 else 1
+    """
+    return (z > 0).astype(np.int32)
+
+
+def preprocess_secret(S: np.ndarray, d: int) -> np.ndarray:
+    """
+    将secret S重复d次，构建冗余序列S^d。
+
+    Parameters
+    ----------
+    S : np.ndarray, shape (m,), dtype int, values in {0,1}
+    d : int — 重复次数
+
+    Returns
+    -------
+    S_d : np.ndarray, shape (m*d,)
+    """
+    return np.tile(S, d)
+
+
+def intra_frame_vote(S_d_recovered: np.ndarray, d: int) -> np.ndarray:
+    """
+    将S^d_i (m*d个bit)按d次重复聚合，恢复单帧secret S_i。
+
+    Parameters
+    ----------
+    S_d_recovered : np.ndarray, shape (m*d,)
+    d : int
+
+    Returns
+    -------
+    S_i : np.ndarray, shape (m,) — 单帧恢复结果
+    """
+    m = len(S_d_recovered) // d
+    chunks = S_d_recovered[:m * d].reshape(d, m)  # (d, m)
+    votes = chunks.sum(axis=0)                     # 对d次重复求和
+    return (votes > d / 2).astype(np.int32)        # majority vote
+
+
+def inter_frame_vote(frame_secrets: list) -> np.ndarray:
+    """
+
+    Parameters
+    ----------
+    frame_secrets : list of np.ndarray, each shape (m,)
+
+    Returns
+    -------
+    S_final : np.ndarray, shape (m,)
+    """
+    stacked = np.stack(frame_secrets, axis=0)      # (n, m)
+    votes = stacked.sum(axis=0)                    # 按位置求和
+    n = len(frame_secrets)
+    return (votes > n / 2).astype(np.int32)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ChaCha20 加密/解密
+# ══════════════════════════════════════════════════════════════════════════
+
+class StreamCipher:
+    """
+    对单帧secret进行加密/解密。
+    - 有pycryptodome时使用ChaCha20 (论文设计)
+    - 无pycryptodome时使用numpy PRNG XOR (仅测试)
+    """
+
+    def __init__(self):
+        self.key = None
+        self.nonce = None
+        self._seed = None  # fallback用
+
+    def generate_key(self):
+        """生成一次性密钥（每帧独立调用）。"""
+        if _HAS_CHACHA:
+            self.key = get_random_bytes(32)
+            self.nonce = get_random_bytes(12)
+        else:
+            self._seed = int.from_bytes(os.urandom(4), 'big')
+
+    def encrypt(self, bits: np.ndarray) -> np.ndarray:
+        """bits: {0,1} array → 加密后的bits。"""
+        if _HAS_CHACHA:
+            raw = np.packbits(bits).tobytes()
+            cipher = ChaCha20.new(key=self.key, nonce=self.nonce)
+            enc = np.unpackbits(np.frombuffer(cipher.encrypt(raw), dtype=np.uint8))
+        else:
+            rng = np.random.RandomState(self._seed)
+            keystream = rng.randint(0, 2, size=len(bits)).astype(np.int32)
+            enc = (bits ^ keystream).astype(np.int32)
+        return enc[:len(bits)]
+
+    def decrypt(self, bits: np.ndarray) -> np.ndarray:
+        """ChaCha20是对称的；fallback XOR同理。"""
+        if _HAS_CHACHA:
+            raw = np.packbits(bits).tobytes()
+            cipher = ChaCha20.new(key=self.key, nonce=self.nonce)
+            dec = np.unpackbits(np.frombuffer(cipher.decrypt(raw), dtype=np.uint8))
+        else:
+            rng = np.random.RandomState(self._seed)
+            keystream = rng.randint(0, 2, size=len(bits)).astype(np.int32)
+            dec = (bits ^ keystream).astype(np.int32)
+        return dec[:len(bits)]
+
+    def state_dict(self) -> dict:
+        """保存密钥状态（供receiver使用）。"""
+        if _HAS_CHACHA:
+            return {'key': self.key, 'nonce': self.nonce}
+        return {'seed': self._seed}
+
+    def load_state_dict(self, d: dict):
+        """加载密钥状态。"""
+        if _HAS_CHACHA:
+            self.key = d['key']
+            self.nonce = d['nonce']
+        else:
+            self._seed = d['seed']
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  GIFStegoEmbedder — 对应论文 Embedding Module
+# ══════════════════════════════════════════════════════════════════════════
+
+class GIFStegoEmbedder:
+    """
+    论文 Section IV-B: Embedding Module。
+
+    用法:
+        embedder = GIFStegoEmbedder(n_frames=16, d=16, latent_dim=4*64*64)
+        latents, keys = embedder.embed(S)
+        # latents: list of n np.ndarray, 每个shape (latent_dim,)
+        # keys:    list of n StreamCipher，供receiver使用
+    """
+
+    def __init__(self, n_frames: int = 16, d: int = 16, latent_dim: int = 4 * 64 * 64):
+        """
+        Parameters
+        ----------
+        n_frames : int — GIF帧数 (n=16)
+        d        : int — secret重复次数 (默认d=16)
+        latent_dim : int — 每帧latent维度 (4*64*64=16384)
+        """
+        self.n = n_frames
+        self.d = d
+        self.latent_dim = latent_dim
+        # 论文公式: C_frame = latent_dim / d
+        self.capacity = latent_dim // d  # 每帧能嵌入的secret bit数
+
+    def embed(self, S: np.ndarray):
+        """
+        完整嵌入流程:
+          S -> 重复d次 -> 每帧独立ChaCha20加密 -> sign-aware mapping -> latent Z'_T
+
+        Parameters
+        ----------
+        S : np.ndarray, shape (capacity,), dtype int, values in {0,1}
+            用户的secret message
+
+        Returns
+        -------
+        latents : list of np.ndarray  — 每帧的初始latent，长度n
+        ciphers : list of StreamCipher — 每帧的密钥，供receiver持有
+        """
+        assert len(S) == self.capacity, (
+            f"Secret长度应为{self.capacity}bits，实际{len(S)}bits\n"
+            f"(由 latent_dim={self.latent_dim} / d={self.d} 决定)"
+        )
+
+        # Step 1: 重复d次 → S^d，shape (latent_dim,)
+        S_d = preprocess_secret(S, self.d)  # (latent_dim,)
+
+        latents = []
+        ciphers = []
+
+        for i in range(self.n):
+            # Step 2: 每帧独立密钥加密 → m_i，shape (latent_dim,)
+            cipher = StreamCipher()
+            cipher.generate_key()
+            m_i = cipher.encrypt(S_d)
+
+            # Step 3: sign-aware mapping → Z'_T，shape (latent_dim,)  [论文公式2,3]
+            z_i = sign_aware_mapping(m_i)
+
+            latents.append(z_i.reshape(-1))  
+            ciphers.append(cipher)
+
+        return latents, ciphers
+
+
+class GIFStegoExtractor:
+    """
+    论文 Section IV-C & IV-D: Extraction Module + Verification Module。
+
+    用法:
+        extractor = GIFStegoExtractor(n_frames=16, d=16, latent_dim=4*64*64)
+        S_recovered = extractor.extract(inverted_latents, ciphers)
+    """
+
+    def __init__(self, n_frames: int = 16, d: int = 16, latent_dim: int = 4 * 64 * 64):
+        self.n = n_frames
+        self.d = d
+        self.latent_dim = latent_dim
+        self.capacity = latent_dim // d
+
+    def extract_single_frame(self, z_recovered: np.ndarray, cipher: StreamCipher) -> np.ndarray:
+        """
+        单帧提取流程 (Extraction Module):
+          Z'_T → 取符号恢复m_i → ChaCha20解密 → 帧内majority vote → S_i
+
+        Parameters
+        ----------
+        z_recovered : np.ndarray, shape (4,64,64) or (latent_dim,)
+            DDIM inversion后恢复的latent
+
+        Returns
+        -------
+        S_i : np.ndarray, shape (capacity,) — 单帧恢复的secret
+        """
+        z_flat = z_recovered.flatten()[:self.latent_dim]
+
+        m_i_recovered = inverse_sign_mapping(z_flat)  # shape (latent_dim,)
+
+        S_d_recovered = cipher.decrypt(m_i_recovered)
+
+        S_i = intra_frame_vote(S_d_recovered, self.d)
+
+        return S_i
+
+    def extract(self, inverted_latents: list, ciphers: list) -> np.ndarray:
+        """
+        完整提取流程 (Extraction + Verification Module):
+          各帧单独提取 → 帧间majority voting → S'
+
+        Parameters
+        ----------
+        inverted_latents : list of np.ndarray — DDIM inversion结果，长度n
+        ciphers          : list of StreamCipher — 对应每帧密钥，长度n
+
+        Returns
+        -------
+        S_final : np.ndarray, shape (capacity,) — 最终恢复的secret
+        """
+        assert len(inverted_latents) == len(ciphers) == self.n
+
+        # Extraction Module: 每帧独立提取
+        frame_secrets = []
+        for i, (z, cipher) in enumerate(zip(inverted_latents, ciphers)):
+            S_i = self.extract_single_frame(z, cipher)
+            frame_secrets.append(S_i)
+
+        # Verification Module: 帧间majority voting [论文公式(8), Fig.3]
+        S_final = inter_frame_vote(frame_secrets)
+        return S_final
+
+
+
+
+class Gaussian_Shading:
+
     def __init__(self, ch_factor, hw_factor, fpr, user_number, output_dir='./output'):
         self.ch = ch_factor
         self.hw = hw_factor
-        self.key = None
-        self.watermark = None
-        self.latentlength = 4 * 64 * 64
-        self.marklength = self.latentlength // (self.ch * self.hw * self.hw)
         self.output_dir = output_dir
-
-        # Save directories
         self.watermark_dir = os.path.join(output_dir, 'watermarks')
         self.key_dir = os.path.join(output_dir, 'keys')
+        self.latent_dim = 4 * 64 * 64
+        self.d = self.ch * self.hw * self.hw         
+        self.capacity = self.latent_dim // self.d
+        self._ciphers = []
+        self._watermark = None
 
-        self.threshold = 1 if self.hw == 1 and self.ch == 1 else self.ch * self.hw * self.hw // 2
-        self.tp_onebit_count = 0
-        self.tp_bits_count = 0
-        self.tau_onebit = None
-        self.tau_bits = None
+        # 复用新实现
+        self._embedder = GIFStegoEmbedder(n_frames=16, d=self.d,
+                                           latent_dim=self.latent_dim)
+        self._extractor = GIFStegoExtractor(n_frames=16, d=self.d,
+                                             latent_dim=self.latent_dim)
 
-        for i in range(self.marklength):
-            fpr_onebit = betainc(i + 1, self.marklength - i, 0.5)
-            fpr_bits = betainc(i + 1, self.marklength - i, 0.5) * user_number
-            if fpr_onebit <= fpr and self.tau_onebit is None:
-                self.tau_onebit = i / self.marklength
-            if fpr_bits <= fpr and self.tau_bits is None:
-                self.tau_bits = i / self.marklength
-
-    def truncSampling(self, message):
-        z = np.zeros(self.latentlength)
-        denominator = 2.0
-        ppf = [norm.ppf(j / denominator) for j in range(int(denominator) + 1)]
-        for i in range(self.latentlength):
-            dec_mes = reduce(lambda a, b: 2 * a + b, message[i: i + 1])
-            dec_mes = int(dec_mes)
-            z[i] = truncnorm.rvs(ppf[dec_mes], ppf[dec_mes + 1])
-        z = torch.from_numpy(z).reshape(1, 4, 64, 64).half()
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        return z.to(device)
-
-    def create_watermark_and_return_w(self, group_id=0, save=True):
+    def create_watermark_and_return_w(self, group_id=0, save=True, secret=None):
         """
-        Generate a binary watermark and 16 per-frame initial latents.
-
-        Parameters
-        ----------
-        group_id : int
-            Index used for naming saved files (watermark_tensor{group_id}.pth,
-            key{group_id}_tensor{j}.pth). Default 0.
-        save : bool
-            Whether to persist watermark and key tensors to disk. Default True.
-
-        Returns
-        -------
-        tuple of 16 torch.FloatTensor
-            Per-frame initial latents z_0 ... z_15, each of shape [1, 4, 64, 64].
+        生成secret并嵌入，返回16个latent。
+        secret: 用户传入的bit数组(shape=(capacity,))；None时随机生成。
         """
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.watermark = torch.randint(
-            0, 2, [1, 4 // self.ch, 64 // self.hw, 64 // self.hw]
-        ).to(device)
+        if secret is None:
+            secret = np.random.randint(0, 2, self.capacity).astype(np.int32)
+        self._watermark = secret
 
         if save:
             os.makedirs(self.watermark_dir, exist_ok=True)
-            torch.save(
-                self.watermark.cpu(),
-                os.path.join(self.watermark_dir, f'watermark_tensor{group_id}.pth')
-            )
+            np.save(os.path.join(self.watermark_dir,
+                                 f'watermark_{group_id}.npy'), secret)
 
-        sd = self.watermark.repeat(1, self.ch, self.hw, self.hw)
-        w_list = []
-        self.key = []
+        latents, ciphers = self._embedder.embed(secret)
+        self._ciphers = ciphers
+        latents_4d = [z.reshape(4, 64, 64) if z.size == 4*64*64 else z
+                      for z in latents]
 
         if save:
             os.makedirs(self.key_dir, exist_ok=True)
+            for j, c in enumerate(ciphers):
+                np.save(os.path.join(self.key_dir,
+                                     f'key_{group_id}_frame{j}.npy'),
+                        np.array(list(c.state_dict().values()), dtype=object),
+                        allow_pickle=True)
+        return tuple(latents_4d)
 
-        for j in range(16):
-            key_j = torch.randint(0, 2, [1, 4, 64, 64]).to(device)
-            self.key.append(key_j)
-            if save:
-                torch.save(
-                    key_j.cpu(),
-                    os.path.join(self.key_dir, f'key{group_id}_tensor{j}.pth')
-                )
-            m = ((sd + key_j) % 2).flatten().cpu().numpy()
-            current_w = self.truncSampling(m)
-            w_list.append(current_w)
-
-        return tuple(w_list)
-
-    def diffusion_inverse(self, watermark_sd):
-        ch_stride = 4 // self.ch
-        hw_stride = 64 // self.hw
-        ch_list = [ch_stride] * self.ch
-        hw_list = [hw_stride] * self.hw
-        split_dim1 = torch.cat(torch.split(watermark_sd, tuple(ch_list), dim=1), dim=0)
-        split_dim2 = torch.cat(torch.split(split_dim1, tuple(hw_list), dim=2), dim=0)
-        split_dim3 = torch.cat(torch.split(split_dim2, tuple(hw_list), dim=3), dim=0)
-        vote = torch.sum(split_dim3, dim=0).clone()
-        vote[vote <= self.threshold] = 0
-        vote[vote > self.threshold] = 1
-        return vote
-
-    def eval_watermark(self, reversed_watermark, group_id=0, watermark_path=None):
-        """
-        Evaluate bit accuracy of the recovered watermark.
-
-        Parameters
-        ----------
-        reversed_watermark : torch.Tensor
-            The decoded watermark tensor recovered by the Receiver.
-        group_id : int
-            Index used to locate the saved ground-truth watermark file.
-        watermark_path : str, optional
-            Explicit path to the ground-truth .pth file. If None, the path is
-            inferred from self.watermark_dir and group_id.
-
-        Returns
-        -------
-        float
-            Bit accuracy in [0, 1].
-        """
-        if watermark_path is not None:
-            wm_file = watermark_path
-        else:
-            # Try the standard naming used by create_watermark_and_return_w
-            wm_file = os.path.join(self.watermark_dir, f'watermark_tensor{group_id}.pth')
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.watermark = torch.load(wm_file, map_location=device)
-        print("Target Watermark (self.watermark):")
-        print(self.watermark.cpu().numpy())
-
-        correct = (reversed_watermark == self.watermark).float().mean().item()
-        if correct >= self.tau_onebit:
-            self.tp_onebit_count += 1
-        if correct >= self.tau_bits:
-            self.tp_bits_count += 1
-        return correct
-
-    def get_tpr(self):
-        return self.tp_onebit_count, self.tp_bits_count
-
-class TrainableWatermarkGenerator(nn.Module):
-    def __init__(self, ch=8, hw=8):
-        super().__init__()
-        self.ch = ch
-        self.hw = hw
-        
-        self.key_gen = nn.Sequential(
-            nn.Conv2d(4, 16, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, 4, 1),
-            nn.Sigmoid()
-        )
-        
-        self.wm_gen = nn.Sequential(
-            nn.Conv2d(4//ch, 16, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, 4//ch, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, base_latents):
-        dynamic_key = self.key_gen(base_latents)
-        core_wm = self.wm_gen(base_latents[:, :4//self.ch])
-        sd = core_wm.repeat(1,1,self.hw,self.hw)
-        sd = sd.repeat(1,self.ch,1,1)
-        return base_latents + (sd + dynamic_key) % 2
-
-class WatermarkExtractor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.decoder = nn.Sequential(
-            nn.Conv2d(4, 16, 3, padding=1),
-            nn.GroupNorm(4, 16),
-            nn.GELU(),
-            nn.Conv2d(16, 1, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, noisy_latents):
-        return self.decoder(noisy_latents)
+    def eval_watermark(self, inverted_latents, group_id=0):
+        S_recovered = self._extractor.extract(inverted_latents, self._ciphers)
+        acc = (S_recovered == self._watermark).mean()
+        return float(acc)
