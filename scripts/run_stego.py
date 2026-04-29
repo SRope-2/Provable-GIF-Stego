@@ -19,7 +19,8 @@ from core.inverse_stable_diffusion import InversableStableDiffusionPipeline
 from diffusers import DDIMScheduler
 
 from core.io_utils import *
-from core.image_utils import transform_img
+# 引入图像处理与失真攻击模块
+from core.image_utils import transform_img, image_distortion
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -90,7 +91,7 @@ def run_hiding(args):
     print(f"[*] Group ID   : {args.gen_seed}")
     print(f"{'='*55}\n")
 
-    # 1. 统一初始化 watermark module
+    # 1. 初始化水印模块
     watermark = Gaussian_Shading(
         args.channel_copy, args.hw_copy, args.fpr, args.user_number,
         output_dir=args.output_path, 
@@ -106,7 +107,7 @@ def run_hiding(args):
     print(f"[+] Generated {len(init_latents_list)} per-frame latents.")
     print(f"    Latent shape: {init_latents_list[0].shape}")
 
-    # 3. 运行 AnimateDiff
+    # 3. 运行 AnimateDiff 
     if args.model_path and os.path.isdir(args.model_path):
         try:
             print("\n[*] Loading AnimateDiff pipeline...")
@@ -174,7 +175,6 @@ def run_extraction(args):
     pipe.safety_checker = None
     pipe = pipe.to(device)
 
-    # 2. 统一初始化解码器
     watermark = Gaussian_Shading(
         args.channel_copy, args.hw_copy, args.fpr, args.user_number,
         output_dir=args.output_path,
@@ -183,7 +183,6 @@ def run_extraction(args):
     tester_prompt = ''
     text_embeddings = pipe.get_text_embedding(tester_prompt)
 
-    # 3. 逐帧反演并加载对应密钥
     frames_per_group = 16
     extracted_latents = []
     loaded_ciphers = []
@@ -199,6 +198,11 @@ def run_extraction(args):
             continue
 
         image_w_distortion = Image.open(input_img_path)
+
+        # ====== 核心新增：应用信道失真模拟 (Lossy Channel) ======
+        image_w_distortion = image_distortion(image_w_distortion, seed=args.group_id, args=args)
+        # ==========================================================
+
         image_w_distortion = (
             transform_img(image_w_distortion)
             .unsqueeze(0)
@@ -214,15 +218,13 @@ def run_extraction(args):
             num_inference_steps=args.num_inversion_steps,
         )
 
-        # 统一转为 numpy 数组传递给底层
         extracted_latents.append(reversed_latents_w.cpu().numpy())
 
-        # 根据 Numpy 格式加载相应的密钥字典
+        # 读取 numpy 格式的密钥
         key_file = os.path.join(args.key_dir, f'key_{args.group_id}_frame{frame_id}.npy')
         if os.path.exists(key_file):
             key_data = np.load(key_file, allow_pickle=True)
             cipher = StreamCipher()
-            # 自动适应 ChaCha20 和 后备异或模式
             if len(key_data) == 2:
                 cipher.load_state_dict({'key': key_data[0], 'nonce': key_data[1]})
             else:
@@ -233,12 +235,12 @@ def run_extraction(args):
 
     end_time = time.time()
 
-    # 4. 调用底层 API 完成提取和双重验证
+    # 调用底层 API 自动完成解密与多重多数投票
     if len(extracted_latents) > 0 and len(loaded_ciphers) == len(extracted_latents):
         print("\n[*] Applying Extraction and Majority Voting...")
         S_recovered = watermark._extractor.extract(extracted_latents, loaded_ciphers)
         
-        # 5. 读取 Ground-Truth 并验证准确率
+        # 读取 Ground-Truth 验证准确率
         wm_file = os.path.join(args.watermark_dir, f'watermark_{args.group_id}.npy')
         if os.path.exists(wm_file):
             original_watermark = np.load(wm_file)
@@ -254,7 +256,6 @@ def run_extraction(args):
             print("="*55 + "\n")
         else:
             print(f"[!] Ground-truth watermark not found at: {wm_file}")
-            print(f"    Pass --watermark_dir pointing to the saved watermarks directory.")
     else:
         print("[!] Key extraction failed or missing frames. Cannot verify.")
 
@@ -269,26 +270,36 @@ def main():
 
     parser.add_argument('--mode', type=str, required=True, choices=['hide', 'extract'], help='Sender (hide) or Receiver (extract) mode.')
     parser.add_argument('--model_path', type=str, default='', help='Path to Stable Diffusion v1-5 model directory.')
-    parser.add_argument('--animatediff_path', type=str, default='', help='Path to AnimateDiff repository root (added to sys.path).')
+    parser.add_argument('--animatediff_path', type=str, default='', help='Path to AnimateDiff repository root.')
     parser.add_argument('--motion_module_path', type=str, default='', help='Path to AnimateDiff motion module .ckpt file.')
-    parser.add_argument('--output_path', type=str, default='./output/', help='Root output directory for frames, keys, and watermarks.')
+    parser.add_argument('--output_path', type=str, default='./output/', help='Root output directory.')
     parser.add_argument('--input_gif_dir', type=str, default='', help='[extract] Directory containing frame_001.png … frame_016.png.')
     parser.add_argument('--key_dir', type=str, default='', help='[extract] Directory containing per-frame key tensors.')
     parser.add_argument('--watermark_dir', type=str, default='', help='[extract] Directory containing ground-truth watermark tensors.')
-    parser.add_argument('--group_id', type=int, default=0, help='[extract] Group ID matching the key/watermark file names.')
+    parser.add_argument('--group_id', type=int, default=0, help='[extract] Group ID.')
     parser.add_argument('--prompt', type=str, default='A highly detailed cinematic animation')
-    parser.add_argument('--gen_seed', type=int, default=0, help='[hide] Random seed for generation AND group_id for saved files.')
+    parser.add_argument('--gen_seed', type=int, default=0, help='[hide] Random seed and group_id.')
     parser.add_argument('--height', type=int, default=512)
     parser.add_argument('--width', type=int, default=512)
     parser.add_argument('--num_inference_steps', type=int, default=25)
     parser.add_argument('--guidance_scale', type=float, default=7.5)
     parser.add_argument('--num_inversion_steps', type=int, default=25)
-    parser.add_argument('--channel_copy', type=int, default=1, help='Channel repetition factor (ch). Watermark ch-dim = 4//ch.')
-    parser.add_argument('--hw_copy', type=int, default=2, help='Spatial repetition factor (hw). Watermark spatial = 64//hw.')
+    parser.add_argument('--channel_copy', type=int, default=1, help='Channel repetition factor (ch).')
+    parser.add_argument('--hw_copy', type=int, default=2, help='Spatial repetition factor (hw).')
     parser.add_argument('--user_number', type=int, default=1_000_000)
-    parser.add_argument('--fpr', type=float, default=1e-6, help='Target false positive rate for threshold calibration.')
-    # 保持参数兼容性，底层代码已自动接管加密推断逻辑
-    parser.add_argument('--chacha', action='store_true', help='Use ChaCha20 stream cipher (auto-detected by StreamCipher).')
+    parser.add_argument('--fpr', type=float, default=1e-6)
+    parser.add_argument('--chacha', action='store_true', help='Use ChaCha20 stream cipher.')
+
+    # ===== 新增：鲁棒性测试 (Robustness Evaluation) 命令行参数 =====
+    parser.add_argument('--jpeg_ratio', type=int, default=None, help='JPEG compression quality (e.g., 50)')
+    parser.add_argument('--random_crop_ratio', type=float, default=None)
+    parser.add_argument('--random_drop_ratio', type=float, default=None)
+    parser.add_argument('--resize_ratio', type=float, default=None, help='Resize ratio (e.g., 0.5)')
+    parser.add_argument('--gaussian_blur_r', type=float, default=None, help='Gaussian blur radius (e.g., 3)')
+    parser.add_argument('--median_blur_k', type=int, default=None, help='Median blur kernel size')
+    parser.add_argument('--gaussian_std', type=float, default=None, help='Gaussian noise standard deviation')
+    parser.add_argument('--sp_prob', type=float, default=None, help='Salt and pepper noise probability')
+    parser.add_argument('--brightness_factor', type=float, default=None)
 
     args = parser.parse_args()
 
