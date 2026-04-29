@@ -115,7 +115,7 @@ This will:
 - Generate 16 per-frame watermarked initial latents
 - Run AnimateDiff to produce a 16-frame GIF
 - Save frames as `output/frames_group42/frame_001.png ... frame_016.png`
-- Save per-frame keys to `output/keys/` and the ground-truth watermark to `output/watermarks/`
+- Save per-frame keys to `output/keys/` and the ground-truth secret message to `output/watermarks/`
 
 ### Receiver — Extract and Verify
 
