@@ -14,7 +14,7 @@ import sys
 # Ensure project root is on sys.path regardless of working directory
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from core.watermark_core import Gaussian_Shading, StreamCipher
+from core.method_core import Gaussian_Shading, StreamCipher
 from core.inverse_stable_diffusion import InversableStableDiffusionPipeline
 from diffusers import DDIMScheduler
 
