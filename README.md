@@ -134,7 +134,17 @@ python scripts/run_stego.py \
     --hw_copy 2 \
     --chacha
 ```
+### Robustness Evaluation (Lossy Channel Simulation)
+To reproduce the robustness experiments (e.g., Table I in the paper), you can apply various distortions during the extraction phase by adding the corresponding arguments. 
 
+**Example 1: JPEG Compression (Quality = 50)**
+```bash
+python scripts/run_stego.py \
+    --mode extract \
+    --model_path ./models/stable-diffusion-v1-5 \
+    --input_gif_dir ./output/frames_group0/ \
+    --group_id 0 \
+    --jpeg_ratio 50
 ---
 
 ## Parameters
