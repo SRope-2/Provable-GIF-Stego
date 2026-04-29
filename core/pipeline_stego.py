@@ -9,8 +9,7 @@ import inspect
 from typing import Callable, List, Optional, Union
 from dataclasses import dataclass
 
-# [!] 严丝合缝的包导入
-from .watermark_core import Gaussian_Shading, Gaussian_Shading_chacha
+from .watermark_core import Gaussian_Shading
 
 from tqdm import tqdm
 from diffusers.utils import is_accelerate_available
