@@ -144,7 +144,7 @@ python scripts/run_stego.py \
     --group_id 0 \
     --jpeg_ratio 50
 ---
-
+```
 ## Parameters
 
 | Argument | Default | Description |
